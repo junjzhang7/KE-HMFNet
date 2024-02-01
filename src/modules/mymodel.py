@@ -50,31 +50,27 @@ class PatientEncoder(nn.Module):
 
             seq_emb_diag.append(torch.sum(diag_emb, keepdim=True, dim=1))
             seq_emb_proc.append(torch.sum(proc_emb, keepdim=True, dim=1))
-        # [1, adm_len, dim]
+
         seq_emb_diag = torch.cat(seq_emb_diag, dim=1)
         seq_emb_proc = torch.cat(seq_emb_proc, dim=1)
 
         rnn_outs_diag, hidden_diag = self.rnn_encoders[0](seq_emb_diag)
         rnn_outs_proc, hidden_proc = self.rnn_encoders[1](seq_emb_proc)
 
-        visit_feats = torch.cat(
-            [rnn_outs_diag, rnn_outs_proc], dim=-1
-        )  # [bs, seq_len, 2*dim]
+        visit_feats = torch.cat([rnn_outs_diag, rnn_outs_proc], dim=-1)
 
-        queries = self.query(visit_feats).squeeze(0)  # [seq_len, dim]
+        queries = self.query(visit_feats).squeeze(0)
         query = queries[-1:]
 
         if len(patient_record) > 1:
-            history_keys = queries[:-1]  # (#admission-1,hidden_size)
+            history_keys = queries[:-1]
 
             history_values = np.zeros((len(patient_record) - 1, self.med_voc_size))
             for idx, admission in enumerate(patient_record):
                 if idx == len(patient_record) - 1:
                     break
                 history_values[idx, admission[2]] = 1
-            history_values = torch.FloatTensor(history_values).to(
-                self.device
-            )  # [1, 131]
+            history_values = torch.FloatTensor(history_values).to(self.device)
         else:
             history_keys = None
             history_values = None
@@ -110,34 +106,19 @@ class PriorEncoder(nn.Module):
     def forward(self, query, history_keys, history_values):
         prior_graph_emb = self.ehr_gcn() - self.inter * self.ddi_gcn()  # [131, 64]
         # 1. read drug_graph memory
-        weights_embedding = F.softmax(
-            torch.mm(query, prior_graph_emb.t()), dim=-1
-        )  # [1, med_voc_size]
-
-        weights_embedding = torch.diag(
-            weights_embedding.squeeze(0)
-        )  # [med_voc_size, med_voc_size]
-
-        graph_context1 = torch.matmul(
-            weights_embedding, prior_graph_emb
-        )  # [med_voc_size, dim]
-
+        weights_embedding = F.softmax(torch.mm(query, prior_graph_emb.t()), dim=-1)
+        weights_embedding = torch.diag(weights_embedding.squeeze(0))
+        graph_context1 = torch.matmul(weights_embedding, prior_graph_emb)
         # 2. read history memory
         if history_keys is None:
             graph_context2 = graph_context1
         else:
-            visit_weight = F.softmax(
-                torch.mm(query, history_keys.t()), dim=-1
-            )  # [1, slots]
-            weighted_values = visit_weight.mm(history_values)  # (1, 131)
+            visit_weight = F.softmax(torch.mm(query, history_keys.t()), dim=-1)
+            weighted_values = visit_weight.mm(history_values)
 
-            weighted_values = torch.diag(
-                weighted_values.squeeze(0)
-            )  # [med_voc_size, med_voc_size]
+            weighted_values = torch.diag(weighted_values.squeeze(0))
 
-            graph_context2 = torch.mm(
-                weighted_values, prior_graph_emb
-            )  # [med_voc_size, 64]
+            graph_context2 = torch.mm(weighted_values, prior_graph_emb)
 
         memory_context = self.proj(torch.cat([graph_context1, graph_context2], -1))
 
@@ -207,63 +188,41 @@ class MyModel(torch.nn.Module):
     ):
         query, history_keys, history_values = self.patient_encoder(patient_data)
         # ==============> Prior Knowledge Graph
-        prior_context = self.prior_encoder(
-            query, history_keys, history_values
-        )  # [131, dim]
+        prior_context = self.prior_encoder(query, history_keys, history_values)
         # <============== Prior Knowledge Graph
 
         # ==============> molecule context
-        global_embeddings = self.global_encoder(**mol_data)  # (4) [283, 64]
-        global_embeddings = torch.mm(
-            average_projection, global_embeddings
-        )  # [131, 283]x[283, 64]=[131, 64]
-
-        substruct_embeddings = self.substruct_encoder(**substruct_data).unsqueeze(
-            0
-        )  # [1, 491, 64]
+        global_embeddings = self.global_encoder(**mol_data)
+        global_embeddings = torch.mm(average_projection, global_embeddings)
+        substruct_embeddings = self.substruct_encoder(**substruct_data).unsqueeze(0)
 
         mole_context = self.aggregate_mole_context(
             query.unsqueeze(0),
             global_embeddings.unsqueeze(0),
             substruct_embeddings,
             ddi_mask_H,
-        ).squeeze(
-            0
-        )  # [131, 64]
+        ).squeeze(0)
         # <============== molecule context
 
         h = torch.cat([prior_context, mole_context], -1)
 
-        logits = self.score_extractor(h).t()  # [1, 131]
+        logits = self.score_extractor(h).t()
 
-        neg_pred_prob = torch.sigmoid(logits)  # [1, 131]
+        neg_pred_prob = torch.sigmoid(logits)
         neg_pred_prob = torch.matmul(neg_pred_prob.t(), neg_pred_prob)
         batch_neg = 0.0005 * neg_pred_prob.mul(tensor_ddi_adj).sum()
 
         return logits, batch_neg
 
     def aggregate_mole_context(self, query, global_emb, sub_emb, ddi_mask_H):
-        """_summary_
-
-        Args:
-            query (_type_): [1, 1, 64]
-            global_emb (_type_): [1, 131, 64]
-            sub_emb (_type_): [1, 491, 64]
-            ddi_mask_H (_type_): [131, 491]
-
-        Returns:
-            _type_: [1, 131, 64]
-        """
-        global_weight = torch.sigmoid(
-            self.global_rela(query.squeeze(0).squeeze(0))
-        )  # [131]
+        global_weight = torch.sigmoid(self.global_rela(query.squeeze(0).squeeze(0)))
         global_weight = torch.diag(global_weight)
 
         weithted_global_emb = torch.matmul(global_weight, global_emb)
 
         substruct_weight = torch.sigmoid(
             self.substruct_rela(query.squeeze(0).squeeze(0))
-        )  # [491]
+        )
         substruct_weight = torch.diag(substruct_weight)
 
         weighted_sub_emb = torch.matmul(substruct_weight, sub_emb)
@@ -291,28 +250,22 @@ class AdjAttenAgger(torch.nn.Module):
         self.model_dim = mid_dim
         self.Qdense = torch.nn.Linear(Qdim, mid_dim)
         self.Kdense = torch.nn.Linear(Kdim, mid_dim)
-        # self.use_ln = use_ln
 
     def forward(
         self, global_embeddings, substruct_embeddings, substruct_weight, mask=None
     ):
-        Q = self.Qdense(global_embeddings)  # [131, 64]
-        K = self.Kdense(substruct_embeddings)  # [491, 64]
-        Attn = torch.matmul(Q, K.transpose(0, 1)) / math.sqrt(
-            self.model_dim
-        )  # [131, 491]
+        Q = self.Qdense(global_embeddings)
+        K = self.Kdense(substruct_embeddings)
+        Attn = torch.matmul(Q, K.transpose(0, 1)) / math.sqrt(self.model_dim)
 
-        if mask is not None:  # [131, 494]
+        if mask is not None:
             Attn = Attn.masked_fill(mask == 0, float("-inf"))
 
-        Attn = torch.softmax(Attn, dim=-1)  # (9)[131, 491] 子结构相对于整体分子图的注意力分数
-        # print(Attn[0])
-        # print(mask[0])
-        substruct_weight = torch.diag(substruct_weight)  # [491]-->[491, 491]
-        substruct_embeddings = torch.matmul(
-            substruct_weight, substruct_embeddings
-        )  # [491, 491] x [491, 64] = [491, 64]
-        O = torch.matmul(Attn, substruct_embeddings)  # [131, 491] x [491, 64]=[131, 64]
+        Attn = torch.softmax(Attn, dim=-1)
+
+        substruct_weight = torch.diag(substruct_weight)
+        substruct_embeddings = torch.matmul(substruct_weight, substruct_embeddings)
+        O = torch.matmul(Attn, substruct_embeddings)
 
         return O
 

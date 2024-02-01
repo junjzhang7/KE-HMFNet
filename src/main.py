@@ -145,8 +145,8 @@ def main():
         emb_dim=args.dim,
         voc_size=voc_size,
         substruct_num=ddi_mask_H.shape[1],
-        ehr_adj_path="/home/zjj/code/KE-HMFNet/data/ehr_adj_final.pkl",
-        ddi_adj_path="/home/zjj/code/KE-HMFNet/data/ddi_A_final.pkl",
+        ehr_adj_path="data/ehr_adj_final.pkl",
+        ddi_adj_path="data/ddi_A_final.pkl",
         device=device,
         dropout=args.dp,
     ).to(device)
